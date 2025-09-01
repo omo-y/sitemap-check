@@ -1,0 +1,16 @@
+services:
+  sitemap-checker:
+    build: .
+    container_name: sitemap-checker
+    env_file:
+      - .env
+    volumes:
+      - ./output:/app/output
+    command:
+      - --sitemap=${SITEMAP_URL}
+      - --concurrency=${CONCURRENCY:-20}
+      - --timeout=${TIMEOUT:-30}
+      - --method=${HTTP_METHOD:-HEAD}
+      - --output=output/result.csv
+      # - --respect-robots           # 必要なら .env ではなくここを有効化
+    restart: "no"
