@@ -4,8 +4,35 @@ on:
   workflow_dispatch:
     inputs:
       sites:
-        description: "1行1サイトのURL（例: https://example.com/sitemap.xml）"
+        description: "1行1サイト。形式: ①URLのみ ②URL,method,concurrency,timeout"
         required: true
+        type: string
+      default_method:
+        description: "未指定行に使うHTTPメソッド"
+        required: true
+        default: "HEAD"
+        type: choice
+        options: [HEAD, GET]
+      default_concurrency:
+        description: "未指定行に使う並列数"
+        required: true
+        default: "20"
+        type: string
+      default_timeout:
+        description: "未指定行に使うタイムアウト秒"
+        required: true
+        default: "30"
+        type: string
+      respect_robots:
+        description: "robots.txt を尊重する（--respect-robots）"
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      max_urls:
+        description: "最大URL数（空なら無制限）"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -19,7 +46,96 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Echo inputs (debug)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        run: docker pull $IMAGE_NAME:latest
+
+      - name: Prepare output dir
+        run: mkdir -p output
+
+      - name: Run for each site (sequential)
+        env:
+          SITES_INPUT: ${{ github.event.inputs.sites }}
+          DEFAULT_METHOD: ${{ github.event.inputs.default_method }}
+          DEFAULT_CONCURRENCY: ${{ github.event.inputs.default_concurrency }}
+          DEFAULT_TIMEOUT: ${{ github.event.inputs.default_timeout }}
+          RESPECT_ROBOTS: ${{ github.event.inputs.respect_robots }}
+          MAX_URLS: ${{ github.event.inputs.max_urls }}
+          ENABLE_NOTIFY: ${{ secrets.ENABLE_NOTIFY }}
+          NOTIFY_ON_FAILURE_ONLY: ${{ secrets.NOTIFY_ON_FAILURE_ONLY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_SUBJECT: ${{ secrets.MAIL_SUBJECT }}
         run: |
-          echo "SITES:"
-          printf '%s\n' "${{ github.event.inputs.sites }}"
+          set -euo pipefail
+          IFS=$'\n'
+          for LINE in $SITES_INPUT; do
+            [[ -z "$LINE" || "$LINE" =~ ^# ]] && continue
+
+            URL=$(echo "$LINE" | cut -d',' -f1 | xargs)
+            METHOD=$(echo "$LINE" | cut -d',' -f2 | xargs)
+            CONCURRENCY=$(echo "$LINE" | cut -d',' -f3 | xargs)
+            TIMEOUT=$(echo "$LINE" | cut -d',' -f4 | xargs)
+
+            [[ -z "$METHOD" ]] && METHOD="$DEFAULT_METHOD"
+            [[ -z "$CONCURRENCY" ]] && CONCURRENCY="$DEFAULT_CONCURRENCY"
+            [[ -z "$TIMEOUT" ]] && TIMEOUT="$DEFAULT_TIMEOUT"
+
+            NAME=$(echo "$URL" | sed -E 's~https?://~~; s~/.*~~; s/[^A-Za-z0-9._-]/_/g')
+            OUT="output/result-${NAME}-${GITHUB_RUN_ID}.csv"
+
+            EXTRA=""
+            if [[ "$RESPECT_ROBOTS" == "true" ]]; then
+              EXTRA="$EXTRA --respect-robots"
+            fi
+            if [[ -n "$MAX_URLS" ]]; then
+              EXTRA="$EXTRA --max-urls=$MAX_URLS"
+            fi
+
+            echo ">> Run: $URL (method=$METHOD, conc=$CONCURRENCY, timeout=$TIMEOUT) -> $OUT"
+            docker run --rm \
+              -v "$PWD/output:/app/output" \
+              -e ENABLE_NOTIFY \
+              -e NOTIFY_ON_FAILURE_ONLY \
+              -e SLACK_WEBHOOK_URL \
+              -e SLACK_BOT_TOKEN \
+              -e SLACK_CHANNEL \
+              -e SMTP_HOST \
+              -e SMTP_PORT \
+              -e SMTP_USER \
+              -e SMTP_PASS \
+              -e MAIL_FROM \
+              -e MAIL_TO \
+              -e MAIL_SUBJECT \
+              "$IMAGE_NAME:latest" \
+              --sitemap="$URL" \
+              --concurrency="$CONCURRENCY" \
+              --timeout="$TIMEOUT" \
+              --method="$METHOD" \
+              --output="$OUT" \
+              $EXTRA
+          done
+
+      - name: Upload CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sitemap-checker-csv
+          path: output/*.csv
+          if-no-files-found: warn
+          retention-days: 14
